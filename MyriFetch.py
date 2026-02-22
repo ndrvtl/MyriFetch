@@ -551,8 +551,10 @@ class CSVUnmatchedDialog(ctk.CTkToplevel):
     def __init__(self, parent, unmatched_list):
         super().__init__(parent)
         self.title("Unmatched ROMs")
-        self.geometry("600x400")
+        self.geometry("600x450")
         self.result = None
+        self.forced_matches = []
+        self._checkboxes = []
         self.lift()
         self.focus()
 
@@ -566,21 +568,40 @@ class CSVUnmatchedDialog(ctk.CTkToplevel):
         scroll = ctk.CTkScrollableFrame(self, fg_color=C["bg"])
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
+        has_any_closest = False
         for item in unmatched_list:
-            platform, title, region, reason, closest = (
-                item["platform"],
-                item["title"],
-                item["region"],
-                item["reason"],
-                item.get("closest", ""),
-            )
+            platform = item["platform"]
+            title = item["title"]
+            region = item["region"]
+            reason = item["reason"]
+            closest = item.get("closest", "")
+            closest_item = item.get("closest_item")
 
             frame = ctk.CTkFrame(scroll, fg_color=C["card"])
             frame.pack(fill="x", pady=5)
 
+            top_row = ctk.CTkFrame(frame, fg_color="transparent")
+            top_row.pack(fill="x", padx=10, pady=(5, 0))
+
+            if closest_item:
+                has_any_closest = True
+                var = tk.BooleanVar(value=False)
+                ctk.CTkCheckBox(
+                    top_row,
+                    text="",
+                    variable=var,
+                    width=20,
+                    checkbox_width=18,
+                    checkbox_height=18,
+                ).pack(side="left", padx=(0, 6))
+                self._checkboxes.append((var, closest_item, platform))
             ctk.CTkLabel(
-                frame, text=f"Title: {title}", anchor="w", font=("Arial", 12, "bold")
-            ).pack(fill="x", padx=10, pady=(5, 0))
+                top_row,
+                text=f"Title: {title}",
+                anchor="w",
+                font=("Arial", 12, "bold"),
+            ).pack(side="left", fill="x", expand=True)
+
             ctk.CTkLabel(
                 frame,
                 text=f"Platform: {platform} | Region: {region}",
@@ -591,7 +612,7 @@ class CSVUnmatchedDialog(ctk.CTkToplevel):
             if closest:
                 ctk.CTkLabel(
                     frame,
-                    text=f"Reason: {reason} (closest: {closest})",
+                    text=f"Closest: {closest}",
                     anchor="w",
                     text_color=C["pink"],
                 ).pack(fill="x", padx=10, pady=(0, 5))
@@ -603,9 +624,17 @@ class CSVUnmatchedDialog(ctk.CTkToplevel):
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(pady=10)
 
+        if has_any_closest:
+            ctk.CTkButton(
+                btn_frame,
+                text="Add Selected",
+                fg_color=C["success"],
+                text_color="black",
+                command=lambda: self.close("add_selected"),
+            ).pack(side="left", padx=5)
         ctk.CTkButton(
             btn_frame,
-            text="Continue (Queue Matched Only)",
+            text="Continue (Matched Only)",
             fg_color=C["cyan"],
             text_color="black",
             command=lambda: self.close("continue"),
@@ -621,6 +650,12 @@ class CSVUnmatchedDialog(ctk.CTkToplevel):
 
     def close(self, choice):
         self.result = choice
+        if choice == "add_selected":
+            self.forced_matches = [
+                {"item": item, "platform": platform}
+                for var, item, platform in self._checkboxes
+                if var.get()
+            ]
         self.destroy()
 
 
@@ -2861,17 +2896,17 @@ class UltimateApp(ctk.CTk):
                     break
 
         if not platform_key:
-            return (None, 0, f"Unknown platform: {platform}")
+            return (None, 0, f"Unknown platform: {platform}", None)
 
         if platform_key not in CONSOLES:
-            return (None, 0, f"Platform not supported: {platform_key}")
+            return (None, 0, f"Platform not supported: {platform_key}", None)
 
         platform_path = CONSOLES[platform_key]
 
         self.csv_refresh_complete.clear()
         self.after(0, lambda: self.refresh_dir(platform_path))
         if not self.csv_refresh_complete.wait(timeout=30):
-            return (None, 0, "Timeout loading platform")
+            return (None, 0, "Timeout loading platform", None)
 
         candidates = [item for item in self.file_cache if item["type"] == "file"]
 
@@ -2884,7 +2919,7 @@ class UltimateApp(ctk.CTk):
             candidates = [c for c in candidates if not EXCLUDE_TAGS.search(c["name"])]
 
         if not candidates:
-            return (None, 0, f"No ROMs found for platform")
+            return (None, 0, f"No ROMs found for platform", None)
 
         normalized_title = self._normalize_rom_title(title)
 
@@ -2893,7 +2928,7 @@ class UltimateApp(ctk.CTk):
         for item in candidates:
             normalized_rom = self._normalize_rom_title(item["name"])
             if normalized_rom == normalized_title:
-                return (item, 1.0, "Exact match")
+                return (item, 1.0, "Exact match", None)
 
             score = SequenceMatcher(None, normalized_title, normalized_rom).ratio()
             if score > best_score:
@@ -2901,13 +2936,14 @@ class UltimateApp(ctk.CTk):
                 best_match = item
 
         if best_score >= 0.85:
-            return (best_match, best_score, "Fuzzy match")
+            return (best_match, best_score, "Fuzzy match", None)
         else:
             closest_name = best_match["name"] if best_match else ""
             return (
                 None,
                 best_score,
                 f"No match (closest: {closest_name} - {int(best_score*100)}%)",
+                best_match,
             )
 
     def import_csv_roms(self, filepath):
@@ -2972,7 +3008,7 @@ class UltimateApp(ctk.CTk):
                 ),
             )
 
-            item, score, reason = self._match_csv_row(platform, title, region)
+            item, score, reason, closest_item = self._match_csv_row(platform, title, region)
             if item:
                 matched.append(
                     {
@@ -2996,6 +3032,7 @@ class UltimateApp(ctk.CTk):
                         "region": region,
                         "reason": reason,
                         "closest": closest,
+                        "closest_item": closest_item,
                     }
                 )
 
@@ -3003,8 +3040,18 @@ class UltimateApp(ctk.CTk):
 
         if unmatched:
             dialog = CSVUnmatchedDialog(self, unmatched)
-            if dialog.result != "continue":
+            if dialog.result == "cancel":
                 return
+            for fm in dialog.forced_matches:
+                matched.append(
+                    {
+                        "platform": fm["platform"],
+                        "title": fm["item"]["name"],
+                        "region": "",
+                        "item": fm["item"],
+                        "score": 0,
+                    }
+                )
 
         if not matched:
             CustomPopup(self, "Info", "No ROMs matched from CSV", ["OK"])
