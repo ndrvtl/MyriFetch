@@ -16,9 +16,12 @@ import subprocess
 import platform
 import sys
 import re
+import csv
 import webbrowser
 from datetime import datetime
 import zipfile
+from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Windows sound import (conditional)
 try:
@@ -2589,6 +2592,45 @@ class UltimateApp(ctk.CTk):
 
         threading.Thread(target=_work, daemon=True).start()
 
+    def _fetch_listing(self, path):
+        """Fetch and parse a directory listing without touching UI state. Thread-safe."""
+        req_headers = HEADERS.copy()
+        if "myrient.erista.me" not in path:
+            req_headers.pop("Referer", None)
+            req_headers.pop("Origin", None)
+        url = BASE_URL + unquote(path)
+        r = requests.get(url, headers=req_headers, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        parsed = []
+        for row in soup.find_all("tr"):
+            links = row.find_all("a")
+            if not links:
+                continue
+            href = links[0].get("href")
+            name = links[0].text.strip()
+            if href in ("../", "/") or name == "Parent Directory" or "?" in href:
+                continue
+            is_dir = href.endswith("/")
+            size_text = ""
+            cols = row.find_all("td")
+            if len(cols) >= 2 and not is_dir:
+                for c in cols:
+                    txt = c.text.strip()
+                    if any(x in txt for x in ("M", "G", "K", "B")):
+                        if len(txt) < 10 and txt != name:
+                            size_text = txt
+                            break
+            parsed.append(
+                {
+                    "name": unquote(name).strip("/"),
+                    "href": href,
+                    "type": "dir" if is_dir else "file",
+                    "size": size_text,
+                }
+            )
+        return parsed
+
     def filter_list(self, event=None):
         search = self.search_var.get().lower()
         region = self.region_var.get().lower()
@@ -2869,8 +2911,6 @@ class UltimateApp(ctk.CTk):
             self._queue_items(targets)
 
     def _normalize_rom_title(self, title):
-        import re
-
         title = os.path.splitext(title)[0]
         title = re.sub(r"\([A-Za-z, ]+\)", "", title)
         title = re.sub(r"\(Disc \d+\)", "", title)
@@ -2885,51 +2925,25 @@ class UltimateApp(ctk.CTk):
         patterns = REGION_PATTERNS.get(region_filter.lower(), [region_filter.lower()])
         return any(pattern in filename_lower for pattern in patterns)
 
-    def _match_csv_row(self, platform, title, region):
-        from difflib import SequenceMatcher
-
-        platform_key = CSV_PLATFORM_ALIASES.get(platform.strip().lower())
-        if not platform_key:
-            for k in CONSOLES.keys():
-                if k.lower() == platform.strip().lower():
-                    platform_key = k
-                    break
-
-        if not platform_key:
-            return (None, 0, f"Unknown platform: {platform}", None)
-
-        if platform_key not in CONSOLES:
-            return (None, 0, f"Platform not supported: {platform_key}", None)
-
-        platform_path = CONSOLES[platform_key]
-
-        self.csv_refresh_complete.clear()
-        self.after(0, lambda: self.refresh_dir(platform_path))
-        if not self.csv_refresh_complete.wait(timeout=30):
-            return (None, 0, "Timeout loading platform", None)
-
-        candidates = [item for item in self.file_cache if item["type"] == "file"]
-
+    def _match_against(self, candidates, title, region, norm_cache):
+        """Pure in-memory fuzzy match against a pre-fetched, pre-normalized candidate list."""
+        pool = candidates
         if region and region.lower() != "all regions":
-            candidates = [
-                item for item in candidates if self._match_region(item["name"], region)
-            ]
-
+            pool = [item for item in pool if self._match_region(item["name"], region)]
         if not EXCLUDE_TAGS.search(title):
-            candidates = [c for c in candidates if not EXCLUDE_TAGS.search(c["name"])]
-
-        if not candidates:
-            return (None, 0, f"No ROMs found for platform", None)
+            pool = [c for c in pool if not EXCLUDE_TAGS.search(c["name"])]
+        if not pool:
+            return (None, 0, "No ROMs found for region/filters", None)
 
         normalized_title = self._normalize_rom_title(title)
-
         best_match = None
         best_score = 0
-        for item in candidates:
-            normalized_rom = self._normalize_rom_title(item["name"])
+        for item in pool:
+            normalized_rom = norm_cache.get(
+                item["name"], self._normalize_rom_title(item["name"])
+            )
             if normalized_rom == normalized_title:
                 return (item, 1.0, "Exact match", None)
-
             score = SequenceMatcher(None, normalized_title, normalized_rom).ratio()
             if score > best_score:
                 best_score = score
@@ -2937,18 +2951,15 @@ class UltimateApp(ctk.CTk):
 
         if best_score >= 0.85:
             return (best_match, best_score, "Fuzzy match", None)
-        else:
-            closest_name = best_match["name"] if best_match else ""
-            return (
-                None,
-                best_score,
-                f"No match (closest: {closest_name} - {int(best_score*100)}%)",
-                best_match,
-            )
+        closest_name = best_match["name"] if best_match else ""
+        return (
+            None,
+            best_score,
+            f"No match (closest: {closest_name} - {int(best_score * 100)}%)",
+            best_match,
+        )
 
     def import_csv_roms(self, filepath):
-        import csv
-
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -2980,61 +2991,129 @@ class UltimateApp(ctk.CTk):
 
         self.show_loader()
         self.loading_label.configure(text="Processing CSV...")
-        matched = []
-        unmatched = []
 
-        for idx, row in enumerate(rows):
-            row_lower = {k.lower(): v for k, v in row.items()}
+        # Phase 1: parse/resolve all rows upfront
+        valid_rows = []
+        unmatched = []
+        for row in rows:
+            row_lower = {k.lower(): v for k, v in row.items() if k is not None}
             platform = row_lower.get("platform", "").strip()
             title = row_lower.get("title", "").strip()
             region = row_lower.get("region", "").strip()
 
             if not platform or not title or not region:
-                unmatched.append(
-                    {
-                        "platform": platform,
-                        "title": title,
-                        "region": region,
-                        "reason": "Missing required field",
-                        "closest": "",
-                    }
-                )
+                unmatched.append({
+                    "platform": platform,
+                    "title": title,
+                    "region": region,
+                    "reason": "Missing required field",
+                    "closest": "",
+                })
                 continue
 
+            platform_key = CSV_PLATFORM_ALIASES.get(platform.lower())
+            if not platform_key:
+                for k in CONSOLES.keys():
+                    if k.lower() == platform.lower():
+                        platform_key = k
+                        break
+
+            if not platform_key or platform_key not in CONSOLES:
+                unmatched.append({
+                    "platform": platform,
+                    "title": title,
+                    "region": region,
+                    "reason": f"Unknown platform: {platform}",
+                    "closest": "",
+                })
+                continue
+
+            valid_rows.append({
+                "platform": platform,
+                "platform_key": platform_key,
+                "platform_path": CONSOLES[platform_key],
+                "title": title,
+                "region": region,
+            })
+
+        # Phase 2: parallel-fetch unique platform listings
+        unique_paths = list({r["platform_path"] for r in valid_rows})
+        listings = {}
+        fetch_errors = {}
+
+        self.after(0, lambda n=len(unique_paths): self.loading_label.configure(
+            text=f"Fetching {n} platform(s)..."
+        ))
+
+        def fetch_one(path):
+            try:
+                return path, self._fetch_listing(path), None
+            except Exception as e:
+                return path, None, str(e)
+
+        with ThreadPoolExecutor(max_workers=min(len(unique_paths), 4)) as pool:
+            futures = {pool.submit(fetch_one, p): p for p in unique_paths}
+            for future in as_completed(futures):
+                path, result, err = future.result()
+                if err:
+                    fetch_errors[path] = err
+                else:
+                    listings[path] = [item for item in result if item["type"] == "file"]
+
+        # Phase 3: pre-normalize candidates once per platform
+        norm_caches = {
+            path: {item["name"]: self._normalize_rom_title(item["name"]) for item in candidates}
+            for path, candidates in listings.items()
+        }
+
+        # Phase 4: in-memory matching
+        matched = []
+        total = len(valid_rows)
+        for idx, row in enumerate(valid_rows):
             self.after(
                 0,
-                lambda i=idx + 1, t=len(rows): self.loading_label.configure(
-                    text=f"Processing {i}/{t} ROMs..."
+                lambda i=idx + 1, t=total: self.loading_label.configure(
+                    text=f"Matching {i}/{t} ROMs..."
                 ),
             )
+            path = row["platform_path"]
+            if path in fetch_errors:
+                unmatched.append({
+                    "platform": row["platform"],
+                    "title": row["title"],
+                    "region": row["region"],
+                    "reason": f"Fetch error: {fetch_errors[path]}",
+                    "closest": "",
+                })
+                continue
 
-            item, score, reason, closest_item = self._match_csv_row(platform, title, region)
+            candidates = listings.get(path, [])
+            norm_cache = norm_caches.get(path, {})
+            item, score, reason, closest_item = self._match_against(
+                candidates, row["title"], row["region"], norm_cache
+            )
             if item:
-                matched.append(
-                    {
-                        "platform": platform,
-                        "title": title,
-                        "region": region,
-                        "item": item,
-                        "score": score,
-                    }
-                )
+                matched.append({
+                    "platform": row["platform"],
+                    "title": row["title"],
+                    "region": row["region"],
+                    "item": item,
+                    "score": score,
+                })
             else:
                 closest = (
-                    reason.split("closest: ")[1].split(")")[0]
+                    reason.split("closest: ")[1].split(" -")[0]
                     if "closest:" in reason
                     else ""
                 )
-                unmatched.append(
-                    {
-                        "platform": platform,
-                        "title": title,
-                        "region": region,
-                        "reason": reason,
-                        "closest": closest,
-                        "closest_item": closest_item,
-                    }
-                )
+                unmatched.append({
+                    "platform": row["platform"],
+                    "title": row["title"],
+                    "region": row["region"],
+                    "reason": reason,
+                    "closest": closest,
+                    "closest_item": closest_item,
+                })
 
         self.hide_loader()
 
@@ -3117,8 +3196,6 @@ class UltimateApp(ctk.CTk):
             )
 
     def import_csv_dialog(self):
-        from tkinter import filedialog
-
         filepath = filedialog.askopenfilename(
             title="Select CSV File",
             filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
