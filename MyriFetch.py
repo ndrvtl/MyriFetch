@@ -129,6 +129,11 @@ REGION_PATTERNS = {
     "world": ["world", "(w)"],
 }
 
+EXCLUDE_TAGS = re.compile(
+    r"\((sample|demo|beta|alpha|proto(?:type)?|kiosk|test|unl(?:icensed)?|pirate|hack|aftermarket|homebrew|Rev \d+)\)",
+    re.IGNORECASE,
+)
+
 CONFIG_FILE = os.path.join(APP_DATA, "myrient_ultimate.json")
 ICON_DIR = os.path.join(APP_DATA, "icons")
 BASE_URL = "https://myrient.erista.me/files/"
@@ -2874,6 +2879,9 @@ class UltimateApp(ctk.CTk):
             candidates = [
                 item for item in candidates if self._match_region(item["name"], region)
             ]
+
+        if not EXCLUDE_TAGS.search(title):
+            candidates = [c for c in candidates if not EXCLUDE_TAGS.search(c["name"])]
 
         if not candidates:
             return (None, 0, f"No ROMs found for platform")
