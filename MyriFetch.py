@@ -90,6 +90,45 @@ SHORT_NAMES = {
     "Nintendo 3DS": "3DS",
 }
 
+CSV_PLATFORM_ALIASES = {
+    "ps1": "PlayStation 1",
+    "psx": "PlayStation 1",
+    "playstation": "PlayStation 1",
+    "playstation 1": "PlayStation 1",
+    "ps2": "PlayStation 2",
+    "playstation 2": "PlayStation 2",
+    "ps3": "PlayStation 3",
+    "playstation 3": "PlayStation 3",
+    "psp": "PSP",
+    "playstation portable": "PSP",
+    "gamecube": "GameCube",
+    "gcn": "GameCube",
+    "gc": "GameCube",
+    "wii": "Wii",
+    "nintendo wii": "Wii",
+    "dreamcast": "Dreamcast",
+    "dc": "Dreamcast",
+    "xbox": "Xbox",
+    "microsoft xbox": "Xbox",
+    "snes": "SNES",
+    "super nintendo": "SNES",
+    "gba": "GBA",
+    "game boy advance": "GBA",
+    "gameboy advance": "GBA",
+    "nds": "Nintendo DS",
+    "ds": "Nintendo DS",
+    "nintendo ds": "Nintendo DS",
+    "3ds": "Nintendo 3DS",
+    "nintendo 3ds": "Nintendo 3DS",
+}
+
+REGION_PATTERNS = {
+    "usa": ["usa", "(us)", "(u)", "america"],
+    "europe": ["europe", "eur", "(e)", "european"],
+    "japan": ["japan", "jpn", "(j)", "japanese"],
+    "world": ["world", "(w)"],
+}
+
 CONFIG_FILE = os.path.join(APP_DATA, "myrient_ultimate.json")
 ICON_DIR = os.path.join(APP_DATA, "icons")
 BASE_URL = "https://myrient.erista.me/files/"
@@ -503,6 +542,83 @@ class ThemedDirBrowser(ctk.CTkToplevel):
             self.bind_scroll(err, self.scroll)
 
 
+class CSVUnmatchedDialog(ctk.CTkToplevel):
+    def __init__(self, parent, unmatched_list):
+        super().__init__(parent)
+        self.title("Unmatched ROMs")
+        self.geometry("600x400")
+        self.result = None
+        self.lift()
+        self.focus()
+
+        header = ctk.CTkLabel(
+            self,
+            text=f"{len(unmatched_list)} ROM(s) could not be matched",
+            font=("Arial", 14, "bold"),
+        )
+        header.pack(pady=10)
+
+        scroll = ctk.CTkScrollableFrame(self, fg_color=C["bg"])
+        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for item in unmatched_list:
+            platform, title, region, reason, closest = (
+                item["platform"],
+                item["title"],
+                item["region"],
+                item["reason"],
+                item.get("closest", ""),
+            )
+
+            frame = ctk.CTkFrame(scroll, fg_color=C["card"])
+            frame.pack(fill="x", pady=5)
+
+            ctk.CTkLabel(
+                frame, text=f"Title: {title}", anchor="w", font=("Arial", 12, "bold")
+            ).pack(fill="x", padx=10, pady=(5, 0))
+            ctk.CTkLabel(
+                frame,
+                text=f"Platform: {platform} | Region: {region}",
+                anchor="w",
+                text_color=C["dim"],
+            ).pack(fill="x", padx=10)
+
+            if closest:
+                ctk.CTkLabel(
+                    frame,
+                    text=f"Reason: {reason} (closest: {closest})",
+                    anchor="w",
+                    text_color=C["pink"],
+                ).pack(fill="x", padx=10, pady=(0, 5))
+            else:
+                ctk.CTkLabel(
+                    frame, text=f"Reason: {reason}", anchor="w", text_color=C["pink"]
+                ).pack(fill="x", padx=10, pady=(0, 5))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=10)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Continue (Queue Matched Only)",
+            fg_color=C["cyan"],
+            text_color="black",
+            command=lambda: self.close("continue"),
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            btn_frame,
+            text="Cancel",
+            fg_color=C["card"],
+            command=lambda: self.close("cancel"),
+        ).pack(side="left", padx=5)
+
+        self.wait_window()
+
+    def close(self, choice):
+        self.result = choice
+        self.destroy()
+
+
 class UltimateApp(ctk.CTk):
     def __init__(self):
         self.load_config()
@@ -546,6 +662,9 @@ class UltimateApp(ctk.CTk):
         self.tooltip_window = None
         self.tooltip_job = None
         self.game_metadata_cache = {}
+        self.csv_refresh_complete = threading.Event()
+        self.selected_items = set()
+        self.csv_matches_by_platform = {}
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -784,7 +903,7 @@ class UltimateApp(ctk.CTk):
         self.status_filter = ctk.CTkOptionMenu(
             self.search_container,
             variable=self.status_var,
-            values=["All Status", "Missing Only", "Owned Only"],
+            values=["All Status", "Missing Only", "Owned Only", "Selected Only"],
             command=self.filter_list,
             fg_color=C["card"],
             button_color=C["cyan"],
@@ -868,6 +987,15 @@ class UltimateApp(ctk.CTk):
             command=self.set_mapping,
         )
         self.btn_map.pack(side="right")
+        self.btn_csv_import = ctk.CTkButton(
+            nav,
+            text="📥 CSV",
+            width=60,
+            fg_color=C["card"],
+            hover_color=C["cyan"],
+            command=self.import_csv_dialog,
+        )
+        self.btn_csv_import.pack(side="right", padx=5)
         self.storage_frame = ctk.CTkFrame(
             self.frame_browser, fg_color="transparent", height=20
         )
@@ -2353,6 +2481,13 @@ class UltimateApp(ctk.CTk):
     def refresh_dir(self, path=None):
         self.show_loader()
         target = path if path is not None else self.current_path
+        if target != self.current_path:
+            self.selected_items.clear()
+            if (
+                hasattr(self, "csv_matches_by_platform")
+                and target in self.csv_matches_by_platform
+            ):
+                self.selected_items.update(self.csv_matches_by_platform[target])
 
         def _work():
             try:
@@ -2399,6 +2534,7 @@ class UltimateApp(ctk.CTk):
                     )
                 self.current_path = target
                 self.file_cache = parsed
+                self.csv_refresh_complete.set()
                 self.after(0, self.filter_list)
                 self.after(0, self.update_map_btn)
                 self.after(0, self.update_storage_stats)
@@ -2427,14 +2563,24 @@ class UltimateApp(ctk.CTk):
             if search and search not in name_lower:
                 continue
             if i["type"] != "dir":
-                if region != "all regions" and region not in name_lower:
+                if not self._match_region(i["name"], region):
                     continue
                 if filter_demos and ("(demo)" in name_lower or " demo" in name_lower):
                     continue
                 if filter_revs and ("(rev " in name_lower or " rev " in name_lower):
                     continue
 
-                if ownership != "all status":
+                if ownership == "selected only":
+                    if (
+                        not any(
+                            n == i["name"]
+                            for v, n, h in self.checkboxes
+                            if v.get() == 1
+                        )
+                        and (i["name"], i["href"]) not in self.selected_items
+                    ):
+                        continue
+                elif ownership != "all status":
                     is_owned = False
                     if local_path and os.path.exists(
                         os.path.join(local_path, i["name"])
@@ -2507,6 +2653,9 @@ class UltimateApp(ctk.CTk):
                 ):
                     is_owned = True
                 var = ctk.IntVar()
+                item_key = (item["name"], item["href"])
+                if item_key in self.selected_items:
+                    var.set(1)
                 text_col = C["success"] if is_owned else "white"
                 display_text = f"✔ {item['name']}" if is_owned else item["name"]
                 chk = ctk.CTkCheckBox(
@@ -2517,7 +2666,7 @@ class UltimateApp(ctk.CTk):
                     text_color=text_col,
                     fg_color=C["cyan"],
                     hover_color=C["pink"],
-                    command=self.update_selection_counter,
+                    command=lambda v=var, k=item_key: self.toggle_selection(v, k),
                 )
                 chk.pack(side="left")
                 self.bind_scroll(chk, self.list_frame)
@@ -2536,8 +2685,17 @@ class UltimateApp(ctk.CTk):
                     w.bind("<Enter>", lambda e, n=clean_name: self.on_hover_enter(e, n))
                     w.bind("<Leave>", self.on_hover_leave)
 
+        self.update_selection_counter()
+
+    def toggle_selection(self, var, item_key):
+        if var.get() == 1:
+            self.selected_items.add(item_key)
+        else:
+            self.selected_items.discard(item_key)
+        self.update_selection_counter()
+
     def update_selection_counter(self):
-        count = sum(1 for v, n, h in self.checkboxes if v.get() == 1)
+        count = len(self.selected_items)
         self.btn_dl.configure(text=f"DOWNLOAD SELECTED [{count}]")
 
     def prev_page(self):
@@ -2639,10 +2797,16 @@ class UltimateApp(ctk.CTk):
             self.storage_bar.set(0)
 
     def add_to_queue(self):
-        targets = []
+        targets = list(self.selected_items)
+        self.selected_items.clear()
+        if (
+            hasattr(self, "csv_matches_by_platform")
+            and self.current_path in self.csv_matches_by_platform
+        ):
+            del self.csv_matches_by_platform[self.current_path]
+        self.update_selection_counter()
         for v, n, h in self.checkboxes:
-            if v.get() == 1:
-                targets.append((n, h))
+            v.set(0)
         if targets:
             self._queue_items(targets)
 
@@ -2663,6 +2827,251 @@ class UltimateApp(ctk.CTk):
             if confirm.result != "Yes":
                 return
             self._queue_items(targets)
+
+    def _normalize_rom_title(self, title):
+        import re
+
+        title = os.path.splitext(title)[0]
+        title = re.sub(r"\([A-Za-z, ]+\)", "", title)
+        title = re.sub(r"\(Disc \d+\)", "", title)
+        title = re.sub(r"\(Rev \d+\)", "", title)
+        title = re.sub(r"\s+", " ", title)
+        return title.strip().lower()
+
+    def _match_region(self, filename, region_filter):
+        if region_filter == "all regions" or not region_filter:
+            return True
+        filename_lower = filename.lower()
+        patterns = REGION_PATTERNS.get(region_filter.lower(), [region_filter.lower()])
+        return any(pattern in filename_lower for pattern in patterns)
+
+    def _match_csv_row(self, platform, title, region):
+        from difflib import SequenceMatcher
+
+        platform_key = CSV_PLATFORM_ALIASES.get(platform.strip().lower())
+        if not platform_key:
+            for k in CONSOLES.keys():
+                if k.lower() == platform.strip().lower():
+                    platform_key = k
+                    break
+
+        if not platform_key:
+            return (None, 0, f"Unknown platform: {platform}")
+
+        if platform_key not in CONSOLES:
+            return (None, 0, f"Platform not supported: {platform_key}")
+
+        platform_path = CONSOLES[platform_key]
+
+        self.csv_refresh_complete.clear()
+        self.after(0, lambda: self.refresh_dir(platform_path))
+        if not self.csv_refresh_complete.wait(timeout=30):
+            return (None, 0, "Timeout loading platform")
+
+        candidates = [item for item in self.file_cache if item["type"] == "file"]
+
+        if region and region.lower() != "all regions":
+            candidates = [
+                item for item in candidates if self._match_region(item["name"], region)
+            ]
+
+        if not candidates:
+            return (None, 0, f"No ROMs found for platform")
+
+        normalized_title = self._normalize_rom_title(title)
+
+        best_match = None
+        best_score = 0
+        for item in candidates:
+            normalized_rom = self._normalize_rom_title(item["name"])
+            if normalized_rom == normalized_title:
+                return (item, 1.0, "Exact match")
+
+            score = SequenceMatcher(None, normalized_title, normalized_rom).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = item
+
+        if best_score >= 0.85:
+            return (best_match, best_score, "Fuzzy match")
+        else:
+            closest_name = best_match["name"] if best_match else ""
+            return (
+                None,
+                best_score,
+                f"No match (closest: {closest_name} - {int(best_score*100)}%)",
+            )
+
+    def import_csv_roms(self, filepath):
+        import csv
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    CustomPopup(self, "Error", "CSV file is empty", ["OK"])
+                    return
+
+                fieldnames_lower = [fn.lower() for fn in reader.fieldnames]
+                if (
+                    "platform" not in fieldnames_lower
+                    or "title" not in fieldnames_lower
+                    or "region" not in fieldnames_lower
+                ):
+                    CustomPopup(
+                        self,
+                        "Error",
+                        "CSV must have columns: platform, title, region",
+                        ["OK"],
+                    )
+                    return
+
+                rows = list(reader)
+                if not rows:
+                    CustomPopup(self, "Error", "CSV file has no data rows", ["OK"])
+                    return
+        except Exception as e:
+            CustomPopup(self, "Error", f"Failed to read CSV: {e}", ["OK"])
+            return
+
+        self.show_loader()
+        self.loading_label.configure(text="Processing CSV...")
+        matched = []
+        unmatched = []
+
+        for idx, row in enumerate(rows):
+            row_lower = {k.lower(): v for k, v in row.items()}
+            platform = row_lower.get("platform", "").strip()
+            title = row_lower.get("title", "").strip()
+            region = row_lower.get("region", "").strip()
+
+            if not platform or not title or not region:
+                unmatched.append(
+                    {
+                        "platform": platform,
+                        "title": title,
+                        "region": region,
+                        "reason": "Missing required field",
+                        "closest": "",
+                    }
+                )
+                continue
+
+            self.after(
+                0,
+                lambda i=idx + 1, t=len(rows): self.loading_label.configure(
+                    text=f"Processing {i}/{t} ROMs..."
+                ),
+            )
+
+            item, score, reason = self._match_csv_row(platform, title, region)
+            if item:
+                matched.append(
+                    {
+                        "platform": platform,
+                        "title": title,
+                        "region": region,
+                        "item": item,
+                        "score": score,
+                    }
+                )
+            else:
+                closest = (
+                    reason.split("closest: ")[1].split(")")[0]
+                    if "closest:" in reason
+                    else ""
+                )
+                unmatched.append(
+                    {
+                        "platform": platform,
+                        "title": title,
+                        "region": region,
+                        "reason": reason,
+                        "closest": closest,
+                    }
+                )
+
+        self.hide_loader()
+
+        if unmatched:
+            dialog = CSVUnmatchedDialog(self, unmatched)
+            if dialog.result != "continue":
+                return
+
+        if not matched:
+            CustomPopup(self, "Info", "No ROMs matched from CSV", ["OK"])
+            return
+
+        self.csv_matches_by_platform = {}
+        for match in matched:
+            platform_key = CSV_PLATFORM_ALIASES.get(match["platform"].strip().lower())
+            if not platform_key:
+                for k in CONSOLES.keys():
+                    if k.lower() == match["platform"].strip().lower():
+                        platform_key = k
+                        break
+
+            if platform_key and platform_key in CONSOLES:
+                platform_path = CONSOLES[platform_key]
+                if platform_path not in self.csv_matches_by_platform:
+                    self.csv_matches_by_platform[platform_path] = set()
+                self.csv_matches_by_platform[platform_path].add(
+                    (match["item"]["name"], match["item"]["href"])
+                )
+
+        first_platform_path = list(self.csv_matches_by_platform.keys())[0]
+
+        self.csv_refresh_complete.clear()
+        self.refresh_dir(first_platform_path)
+        self.csv_refresh_complete.wait(timeout=30)
+        self.selected_items.update(self.csv_matches_by_platform.get(first_platform_path, set()))
+
+        self.show_browser()
+
+        def goto_matched_page():
+            sorted_items = sorted(
+                self.filtered_cache, key=lambda x: (x["type"] != "dir", x["name"])
+            )
+            matched_names = {name for name, href in self.selected_items}
+            for idx, item in enumerate(sorted_items):
+                if item["name"] in matched_names:
+                    self.current_page = idx // self.items_per_page
+                    self.render_page()
+                    break
+
+        self.after(100, goto_matched_page)
+
+        total_matched = len(matched)
+        num_platforms = len(self.csv_matches_by_platform)
+        first_platform_name = [
+            k for k, v in CONSOLES.items() if v == first_platform_path
+        ][0]
+        if num_platforms > 1:
+            CustomPopup(
+                self,
+                "CSV Import Complete",
+                f"Matched {total_matched} ROM(s) across {num_platforms} platform(s).\n\nShowing {first_platform_name} ({len(self.csv_matches_by_platform[first_platform_path])} ROM(s) selected).\nSwitch platforms to see other matched ROMs.",
+                ["OK"],
+            )
+        else:
+            CustomPopup(
+                self,
+                "CSV Import Complete",
+                f"Matched {total_matched} ROM(s) for {first_platform_name}.\n\nROMs selected in browser. Click 'DOWNLOAD SELECTED' to queue.",
+                ["OK"],
+            )
+
+    def import_csv_dialog(self):
+        from tkinter import filedialog
+
+        filepath = filedialog.askopenfilename(
+            title="Select CSV File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if filepath:
+            threading.Thread(
+                target=lambda: self.import_csv_roms(filepath), daemon=True
+            ).start()
 
     def _queue_items(self, targets):
         local_dir = self.get_local_folder()
